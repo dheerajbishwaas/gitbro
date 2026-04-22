@@ -11,7 +11,7 @@ import (
 
 	"github.com/fatih/color"
 )
-
+//test commit is corking commit bro or not
 func main() {
 	// Check if git is available
 	if _, err := exec.LookPath("git"); err != nil {
@@ -307,6 +307,14 @@ func generateSuggestions(commitType string, files []string, diff string, lastCom
 		}
 
 		// Based on diff size
+		totalChanges := addCount + delCount
+		if totalChanges < 5 {
+			return []string{
+				"feat: add minor improvements",
+				"fix: resolve small issues",
+				"docs: update comments or documentation",
+			}
+		}
 		if addCount > delCount * 2 {
 			return []string{
 				"feat: add significant new functionality",
