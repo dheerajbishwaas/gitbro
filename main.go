@@ -25,13 +25,11 @@ func main() {
 	cyan := color.New(color.FgCyan)
 	hiBlack := color.New(color.FgHiBlack)
 
-	// Check git
 	if _, err := exec.LookPath("git"); err!= nil {
 		red.Println("❌ Git not found in PATH. Install from https://git-scm.com")
 		os.Exit(1)
 	}
 
-	// Check staged files
 	nameOnly, _ := runGit("diff", "--staged", "--name-only")
 	filesStr := strings.TrimSpace(nameOnly)
 	if filesStr == "" {
@@ -40,7 +38,6 @@ func main() {
 	}
 	files := strings.Split(filesStr, "\n")
 
-	// Get diff, stat, status
 	diff, _ := runGit("diff", "--staged")
 	stat, _ := runGit("diff", "--staged", "--shortstat")
 	status, _ := runGit("diff", "--staged", "--name-status")
@@ -57,6 +54,8 @@ func main() {
 		}
 	}
 
+	// --- RULE ENGINE START ---
+
 	// Rule 1: Version bump
 	for _, f := range files {
 		if strings.HasSuffix(f, "package.json") {
@@ -64,6 +63,7 @@ func main() {
 			if m := re.FindStringSubmatch(diff); len(m) > 1 {
 				add(fmt.Sprintf("chore: bump version to %s", m[1]), "version bump")
 			}
+		}
 		if strings.HasSuffix(f, "Cargo.toml") {
 			re := regexp.MustCompile(`\+\s*version\s*=\s*"(.*)"`)
 			if m := re.FindStringSubmatch(diff); len(m) > 1 {
@@ -139,10 +139,26 @@ func main() {
 		add(fmt.Sprintf("%s: update %s", folderType, name), "folder based")
 	}
 
-	// Rule 12: Fallback
-	if len(suggestions) == 0 {
-		name := strings.TrimSuffix(filepath.Base(files[0]), filepath.Ext(files[0]))
-		add(fmt.Sprintf("chore: update %s", name), "fallback")
+	// --- RULE ENGINE END ---
+
+	// FORCE 3 SUGGESTIONS: Agar 3 se kam hai to generic bharo
+	baseName := strings.TrimSuffix(filepath.Base(files[0]), filepath.Ext(files[0]))
+	scope := getScope(files[0])
+
+	genericPool := []Suggestion{
+		{fmt.Sprintf("chore%s: update %s", scope, baseName), "fallback"},
+		{fmt.Sprintf("refactor%s: improve %s", scope, baseName), "generic"},
+		{fmt.Sprintf("feat%s: enhance functionality", scope), "generic"},
+		{fmt.Sprintf("fix%s: apply changes", scope), "generic"},
+		{fmt.Sprintf("chore: update codebase"), "generic"},
+		{fmt.Sprintf("style: format files"), "generic"},
+	}
+
+	for _, g := range genericPool {
+		if len(suggestions) >= 3 {
+			break
+		}
+		add(g.Msg, g.Rule)
 	}
 
 	// Print suggestions
