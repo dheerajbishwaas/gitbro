@@ -85,7 +85,7 @@ func main() {
 			suggestions = aiSuggestions
 			hiBlack.Println("AI suggestions ready")
 		} else {
-			yellow.Println("AI failed, using rule engine")
+			yellow.Printf("AI failed: %v\n", err)
 		}
 	} else {
 		yellow.Println("GEMINI_API_KEY not set. Using rule engine.")
@@ -177,20 +177,20 @@ Format: [{"subject":"feat(auth): add login","body":"- Add handleLogin function\n
 	}
 
 	jsonData, _ := json.Marshal(reqBody)
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=" + apiKey
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req, _ := http.NewRequest("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent", bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-goog-api-key", apiKey)
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
-	if err!= nil {
-		return nil, err
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode!= 200 {
-		return nil, fmt.Errorf("gemini API error: %s", string(body))
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("gemini API error %d: %s", resp.StatusCode, string(body))
 	}
 
 	var geminiResp GeminiResponse
