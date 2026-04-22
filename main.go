@@ -2,13 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 )
@@ -19,6 +24,28 @@ type Suggestion struct {
 	Rule string
 }
 
+type GeminiRequest struct {
+	Contents []GeminiContent `json:"contents"`
+}
+
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiPart struct {
+	Text string `json:"text"`
+}
+
+type GeminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+}
+
 func main() {
 	green := color.New(color.FgGreen)
 	yellow := color.New(color.FgYellow)
@@ -27,7 +54,7 @@ func main() {
 	hiBlack := color.New(color.FgHiBlack)
 
 	if _, err := exec.LookPath("git"); err!= nil {
-		red.Println("Git not found in PATH. Install from https://git-scm.com")
+		red.Println("Git not found in PATH")
 		os.Exit(1)
 	}
 
@@ -45,122 +72,39 @@ func main() {
 
 	cyan.Println("Analyzing changes...")
 
+	projectName := getProjectName()
+	branch, _ := runGit("rev-parse", "--abbrev-ref", "HEAD")
+	
 	suggestions := []Suggestion{}
-	seen := make(map[string]bool)
-
-	add := func(subject, body, rule string) {
-		subject = strings.ToLower(subject)
-		key := subject + body
-		if!seen[key] && len(suggestions) < 3 {
-			suggestions = append(suggestions, Suggestion{subject, body, rule})
-			seen[key] = true
-		}
-	}
-
-	// Parse diff for details
-	addedLines, removedLines := parseDiffLines(diff)
-	changes := analyzeChangesDetailed(addedLines, removedLines, files)
-
-	// Rule 1: Version bump
-	for _, f := range files {
-		if strings.HasSuffix(f, "package.json") {
-			re := regexp.MustCompile(`\+\s*"version":\s*"(.*)"`)
-			if m := re.FindStringSubmatch(diff); len(m) > 1 {
-				body := "- Bump package version\n- Update dependencies"
-				add(fmt.Sprintf("chore: bump version to %s", m[1]), body, "version bump")
-			}
-		}
-	}
-
-	// Rule 2: New files with details
-	newFiles := getNewFiles(status)
-	if len(newFiles) > 0 {
-		scope := getScope(newFiles[0])
-		body := buildBodyFromFiles("Added:", newFiles)
-		add(fmt.Sprintf("feat%s: add new files", scope), body, "new files")
-	}
-
-	// Rule 3: Deleted files
-	delFiles := getDeletedFiles(status)
-	if len(delFiles) > 0 {
-		body := buildBodyFromFiles("Removed:", delFiles)
-		add("refactor: remove obsolete files", body, "delete files")
-	}
-
-	// Rule 4: Function additions with details
-	if len(changes.NewFunctions) > 0 {
-		scope := getScope(files[0])
-		body := buildBodyFromItems("Added functions:", changes.NewFunctions)
-		if len(changes.NewFunctions) == 1 {
-			add(fmt.Sprintf("feat%s: add %s", scope, changes.NewFunctions[0]), body, "new function")
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	
+	if apiKey!= "" {
+		cyan.Println("Calling Gemini AI (free)...")
+		aiSuggestions, err := getGeminiSuggestions(diff, stat, files, projectName, branch, apiKey)
+		if err == nil && len(aiSuggestions) > 0 {
+			suggestions = aiSuggestions
+			hiBlack.Println("AI suggestions ready")
 		} else {
-			add(fmt.Sprintf("feat%s: add multiple functions", scope), body, "new functions")
+			yellow.Println("AI failed, using rule engine")
 		}
+	} else {
+		yellow.Println("GEMINI_API_KEY not set. Using rule engine.")
+		yellow.Println("Get free key: https://aistudio.google.com/app/apikey")
 	}
 
-	// Rule 5: Bug fixes with context
-	if changes.IsFix {
-		scope := getScope(files[0])
-		body := buildBodyFromItems("Fixed:", changes.FixDetails)
-		add(fmt.Sprintf("fix%s: resolve issues", scope), body, "bug fix")
+	if len(suggestions) == 0 {
+		suggestions = getRuleBasedSuggestions(files, diff, stat, status)
 	}
 
-	// Rule 6: Refactor detection
-	if changes.IsRefactor {
-		scope := getScope(files[0])
-		body := fmt.Sprintf("- Simplified logic in %s\n- Reduced complexity", cleanName(files[0]))
-		add(fmt.Sprintf("refactor%s: improve code structure", scope), body, "refactor")
-	}
-
-	// Rule 7: Test files
-	if onlyMatch(files, []string{".test.", "_test.", ".spec."}) {
-		body := buildBodyFromFiles("Updated tests:", files)
-		add("test: update test cases", body, "tests")
-	}
-
-	// Rule 8: Docs
-	if onlyExt(files, ".md", ".txt", ".rst") {
-		body := "- Update documentation\n- Improve clarity"
-		add("docs: update documentation", body, "docs")
-	}
-
-	// Rule 9: Import/dependency changes
-	if changes.ImportChanges {
-		body := buildBodyFromItems("Updated imports:", changes.ImportDetails)
-		add("refactor: update dependencies", body, "imports")
-	}
-
-	// FORCE 3 SUGGESTIONS with detailed bodies
-	baseName := cleanName(files[0])
-	scope := getScope(files[0])
-	ins, del := parseStat(stat)
-
-	genericBody1 := fmt.Sprintf("- Modified %s\n- Updated %d files\n- %d insertions(+), %d deletions(-)",
-		baseName, len(files), ins, del)
-	genericBody2 := fmt.Sprintf("- Improve %s implementation\n- Update related logic", baseName)
-	genericBody3 := "- Apply code changes\n- Update functionality"
-
-	fallbacks := []Suggestion{
-		{fmt.Sprintf("chore%s: update %s", scope, baseName), genericBody1, "fallback"},
-		{fmt.Sprintf("refactor%s: improve %s", scope, baseName), genericBody2, "generic"},
-		{fmt.Sprintf("feat%s: enhance functionality", scope), genericBody3, "generic"},
-	}
-
-	for _, g := range fallbacks {
-		if len(suggestions) >= 3 {
-			break
-		}
-		add(g.Subject, g.Body, g.Rule)
-	}
-
-	// Print suggestions
 	fmt.Println()
 	green.Println("Select a commit message:")
 	for i, s := range suggestions {
 		fmt.Printf("%d. %s\n", i+1, s.Subject)
 		if s.Body!= "" {
 			for _, line := range strings.Split(s.Body, "\n") {
-				hiBlack.Printf(" %s\n", line)
+				if strings.TrimSpace(line)!= "" {
+					hiBlack.Printf(" %s\n", line)
+				}
 			}
 		}
 		hiBlack.Printf(" %s\n", s.Rule)
@@ -200,15 +144,143 @@ func main() {
 	green.Printf("Committed: %s\n", selected.Subject)
 }
 
-// --- STRUCTS & HELPERS ---
+func getGeminiSuggestions(diff, stat string, files []string, project, branch, apiKey string) ([]Suggestion, error) {
+	if len(diff) > 8000 {
+		diff = diff[:8000] + "\n... [truncated]"
+	}
 
-type ChangeAnalysis struct {
-	NewFunctions []string
-	IsFix bool
-	FixDetails []string
-	IsRefactor bool
-	ImportChanges bool
-	ImportDetails []string
+	prompt := fmt.Sprintf(`You are a git commit message generator. Based on the git diff, generate 3 conventional commit messages.
+
+Project: %s
+Branch: %s
+Files: %s
+Stats: %s
+
+Diff:
+%s
+
+Rules:
+1. Use conventional commits: feat, fix, refactor, chore, docs, test, style
+2. Subject line max 72 chars, lowercase, no period
+3. Add scope like (auth) if files are in subdirectories
+4. Body: 2-4 bullet points explaining WHAT and WHY, max 100 chars per line
+5. Be specific - mention function names from diff
+6. Output ONLY valid JSON array, no markdown
+
+Format: [{"subject":"feat(auth): add login","body":"- Add handleLogin function\n- Validate credentials"},{"subject":"...","body":"..."},{"subject":"...","body":"..."}]`,
+		project, branch, strings.Join(files, ", "), strings.TrimSpace(stat), diff)
+
+	reqBody := GeminiRequest{
+		Contents: []GeminiContent{{
+			Parts: []GeminiPart{{Text: prompt}},
+		}},
+	}
+
+	jsonData, _ := json.Marshal(reqBody)
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=" + apiKey
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err!= nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode!= 200 {
+		return nil, fmt.Errorf("gemini API error: %s", string(body))
+	}
+
+	var geminiResp GeminiResponse
+	if err := json.Unmarshal(body, &geminiResp); err!= nil {
+		return nil, err
+	}
+
+	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+
+	cleanText := strings.TrimSpace(geminiResp.Candidates[0].Content.Parts[0].Text)
+	cleanText = strings.TrimPrefix(cleanText, "```json")
+	cleanText = strings.TrimPrefix(cleanText, "```")
+	cleanText = strings.TrimSuffix(cleanText, "```")
+	cleanText = strings.TrimSpace(cleanText)
+
+	var rawSugs []map[string]string
+	if err := json.Unmarshal([]byte(cleanText), &rawSugs); err!= nil {
+		return nil, err
+	}
+
+	var suggestions []Suggestion
+	for _, rs := range rawSugs {
+		if len(suggestions) >= 3 {
+			break
+		}
+		suggestions = append(suggestions, Suggestion{
+			Subject: rs["subject"],
+			Body: rs["body"],
+			Rule: "gemini ai",
+		})
+	}
+
+	return suggestions, nil
+}
+
+func getRuleBasedSuggestions(files []string, diff, stat, status string) []Suggestion {
+	suggestions := []Suggestion{}
+	seen := make(map[string]bool)
+
+	add := func(subject, body, rule string) {
+		subject = strings.ToLower(subject)
+		key := subject + body
+		if!seen[key] && len(suggestions) < 3 {
+			suggestions = append(suggestions, Suggestion{subject, body, rule})
+			seen[key] = true
+		}
+	}
+
+	addedLines, removedLines := parseDiffLines(diff)
+	changes := analyzeChangesDetailed(addedLines, removedLines)
+
+	if len(changes.NewFunctions) > 0 {
+		scope := getScope(files[0])
+		body := buildBodyFromItems("Added functions:", changes.NewFunctions)
+		add(fmt.Sprintf("feat%s: add %s", scope, changes.NewFunctions[0]), body, "new function")
+	}
+
+	if changes.IsFix {
+		scope := getScope(files[0])
+		body := buildBodyFromItems("Fixed:", changes.FixDetails)
+		add(fmt.Sprintf("fix%s: resolve issues", scope), body, "bug fix")
+	}
+
+	baseName := cleanName(files[0])
+	scope := getScope(files[0])
+	ins, del := parseStat(stat)
+	genericBody := fmt.Sprintf("- Modified %s\n- %d files changed\n- %d insertions(+), %d deletions(-)",
+		baseName, len(files), ins, del)
+
+	fallbacks := []Suggestion{
+		{fmt.Sprintf("chore%s: update %s", scope, baseName), genericBody, "fallback"},
+		{fmt.Sprintf("refactor%s: improve %s", scope, baseName), "- Improve code structure\n- Update implementation", "generic"},
+		{fmt.Sprintf("feat%s: enhance functionality", scope), "- Apply code changes\n- Update features", "generic"},
+	}
+
+	for _, g := range fallbacks {
+		if len(suggestions) >= 3 {
+			break
+		}
+		add(g.Subject, g.Body, g.Rule)
+	}
+
+	return suggestions
+}
+
+func getProjectName() string {
+	dir, _ := os.Getwd()
+	return filepath.Base(dir)
 }
 
 func runGit(args...string) (string, error) {
@@ -233,24 +305,10 @@ func cleanName(file string) string {
 	return strings.ToLower(name)
 }
 
-func getNewFiles(status string) []string {
-	var files []string
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "A\t") {
-			files = append(files, strings.TrimPrefix(line, "A\t"))
-		}
-	}
-	return files
-}
-
-func getDeletedFiles(status string) []string {
-	var files []string
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "D\t") {
-			files = append(files, strings.TrimPrefix(line, "D\t"))
-		}
-	}
-	return files
+type ChangeAnalysis struct {
+	NewFunctions []string
+	IsFix bool
+	FixDetails []string
 }
 
 func parseDiffLines(diff string) ([]string, []string) {
@@ -266,11 +324,10 @@ func parseDiffLines(diff string) ([]string, []string) {
 	return added, removed
 }
 
-func analyzeChangesDetailed(added, removed []string, files []string) ChangeAnalysis {
+func analyzeChangesDetailed(added, removed []string) ChangeAnalysis {
 	analysis := ChangeAnalysis{}
-	
-	// Find new functions
 	re := regexp.MustCompile(`(?i)^func\s+(\w+)|^function\s+(\w+)|^const\s+(\w+)\s*=.*=>|^def\s+(\w+)`)
+	
 	for _, line := range added {
 		if m := re.FindStringSubmatch(line); len(m) > 1 {
 			for i := 1; i < len(m); i++ {
@@ -281,8 +338,7 @@ func analyzeChangesDetailed(added, removed []string, files []string) ChangeAnaly
 		}
 	}
 
-	// Check for fixes
-	fixKeywords := []string{"fix", "bug", "error", "null", "undefined", "panic", "exception", "issue"}
+	fixKeywords := []string{"fix", "bug", "error", "null", "undefined", "panic", "exception"}
 	for _, line := range append(added, removed...) {
 		l := strings.ToLower(line)
 		for _, kw := range fixKeywords {
@@ -293,38 +349,7 @@ func analyzeChangesDetailed(added, removed []string, files []string) ChangeAnaly
 			}
 		}
 	}
-
-	// Check imports
-	for _, line := range append(added, removed...) {
-		l := strings.TrimSpace(line)
-		if strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "require(") ||
-		   strings.HasPrefix(l, "from ") || strings.HasPrefix(l, "use ") {
-			analysis.ImportChanges = true
-			analysis.ImportDetails = append(analysis.ImportDetails, l)
-		}
-	}
-
-	// Refactor detection
-	if len(removed) > len(added)*2 && len(removed) > 3 {
-		analysis.IsRefactor = true
-	}
-
 	return analysis
-}
-
-func buildBodyFromFiles(prefix string, files []string) string {
-	if len(files) == 0 {
-		return ""
-	}
-	lines := []string{prefix}
-	for i, f := range files {
-		if i >= 5 {
-			lines = append(lines, fmt.Sprintf("-... and %d more", len(files)-5))
-			break
-		}
-		lines = append(lines, "- "+filepath.Base(f))
-	}
-	return strings.Join(lines, "\n")
 }
 
 func buildBodyFromItems(prefix string, items []string) string {
@@ -334,45 +359,12 @@ func buildBodyFromItems(prefix string, items []string) string {
 	lines := []string{prefix}
 	seen := make(map[string]bool)
 	for _, item := range items {
-		if!seen[item] && len(lines) < 6 {
+		if!seen[item] && len(lines) < 5 && item!= "" {
 			lines = append(lines, "- "+item)
 			seen[item] = true
 		}
 	}
 	return strings.Join(lines, "\n")
-}
-
-func onlyMatch(files []string, patterns []string) bool {
-	for _, f := range files {
-		ok := false
-		lf := strings.ToLower(f)
-		for _, p := range patterns {
-			if strings.Contains(lf, p) {
-				ok = true
-				break
-			}
-		}
-		if!ok {
-			return false
-		}
-	}
-	return len(files) > 0
-}
-
-func onlyExt(files []string, exts...string) bool {
-	for _, f := range files {
-		ok := false
-		for _, ext := range exts {
-			if strings.HasSuffix(f, ext) {
-				ok = true
-				break
-			}
-		}
-		if!ok {
-			return false
-		}
-	}
-	return len(files) > 0
 }
 
 func parseStat(stat string) (int, int) {
