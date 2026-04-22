@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"os" // <-- Ye line add kar
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -14,7 +14,8 @@ import (
 )
 
 type Suggestion struct {
-	Msg string
+	Subject string
+	Body string
 	Rule string
 }
 
@@ -47,134 +48,128 @@ func main() {
 	suggestions := []Suggestion{}
 	seen := make(map[string]bool)
 
-	add := func(msg, rule string) {
-		msg = strings.ToLower(msg)
-		if!seen[msg] && len(suggestions) < 3 {
-			suggestions = append(suggestions, Suggestion{msg, rule})
-			seen[msg] = true
+	add := func(subject, body, rule string) {
+		subject = strings.ToLower(subject)
+		key := subject + body
+		if!seen[key] && len(suggestions) < 3 {
+			suggestions = append(suggestions, Suggestion{subject, body, rule})
+			seen[key] = true
 		}
 	}
+
+	// Parse diff for details
+	addedLines, removedLines := parseDiffLines(diff)
+	changes := analyzeChangesDetailed(addedLines, removedLines, files)
 
 	// Rule 1: Version bump
 	for _, f := range files {
 		if strings.HasSuffix(f, "package.json") {
 			re := regexp.MustCompile(`\+\s*"version":\s*"(.*)"`)
 			if m := re.FindStringSubmatch(diff); len(m) > 1 {
-				add(fmt.Sprintf("chore: bump version to %s", m[1]), "version bump")
-			}
-		}
-		if strings.HasSuffix(f, "Cargo.toml") {
-			re := regexp.MustCompile(`\+\s*version\s*=\s*"(.*)"`)
-			if m := re.FindStringSubmatch(diff); len(m) > 1 {
-				add(fmt.Sprintf("chore: bump version to %s", m[1]), "version bump")
+				body := "- Bump package version\n- Update dependencies"
+				add(fmt.Sprintf("chore: bump version to %s", m[1]), body, "version bump")
 			}
 		}
 	}
 
-	// Rule 2: New file
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "A\t") {
-			f := strings.TrimPrefix(line, "A\t")
-			scope := getScope(f)
-			name := cleanName(f)
-			add(fmt.Sprintf("feat%s: add %s", scope, name), "new file")
+	// Rule 2: New files with details
+	newFiles := getNewFiles(status)
+	if len(newFiles) > 0 {
+		scope := getScope(newFiles[0])
+		body := buildBodyFromFiles("Added:", newFiles)
+		add(fmt.Sprintf("feat%s: add new files", scope), body, "new files")
+	}
+
+	// Rule 3: Deleted files
+	delFiles := getDeletedFiles(status)
+	if len(delFiles) > 0 {
+		body := buildBodyFromFiles("Removed:", delFiles)
+		add("refactor: remove obsolete files", body, "delete files")
+	}
+
+	// Rule 4: Function additions with details
+	if len(changes.NewFunctions) > 0 {
+		scope := getScope(files[0])
+		body := buildBodyFromItems("Added functions:", changes.NewFunctions)
+		if len(changes.NewFunctions) == 1 {
+			add(fmt.Sprintf("feat%s: add %s", scope, changes.NewFunctions[0]), body, "new function")
+		} else {
+			add(fmt.Sprintf("feat%s: add multiple functions", scope), body, "new functions")
 		}
 	}
 
-	// Rule 3: Delete file
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "D\t") {
-			f := strings.TrimPrefix(line, "D\t")
-			name := cleanName(f)
-			add(fmt.Sprintf("refactor: remove %s", name), "delete file")
-		}
+	// Rule 5: Bug fixes with context
+	if changes.IsFix {
+		scope := getScope(files[0])
+		body := buildBodyFromItems("Fixed:", changes.FixDetails)
+		add(fmt.Sprintf("fix%s: resolve issues", scope), body, "bug fix")
 	}
 
-	// Rule 4: Only test files
+	// Rule 6: Refactor detection
+	if changes.IsRefactor {
+		scope := getScope(files[0])
+		body := fmt.Sprintf("- Simplified logic in %s\n- Reduced complexity", cleanName(files[0]))
+		add(fmt.Sprintf("refactor%s: improve code structure", scope), body, "refactor")
+	}
+
+	// Rule 7: Test files
 	if onlyMatch(files, []string{".test.", "_test.", ".spec."}) {
-		add("test: update tests", "only test files")
+		body := buildBodyFromFiles("Updated tests:", files)
+		add("test: update test cases", body, "tests")
 	}
 
-	// Rule 5: Only docs
+	// Rule 8: Docs
 	if onlyExt(files, ".md", ".txt", ".rst") {
-		add("docs: update documentation", "only docs")
+		body := "- Update documentation\n- Improve clarity"
+		add("docs: update documentation", body, "docs")
 	}
 
-	// Rule 6: Refactor by stats
-	ins, del := parseStat(stat)
-	if del > ins*2 && del > 0 {
-		add("refactor: simplify code", "deletions >> insertions")
+	// Rule 9: Import/dependency changes
+	if changes.ImportChanges {
+		body := buildBodyFromItems("Updated imports:", changes.ImportDetails)
+		add("refactor: update dependencies", body, "imports")
 	}
 
-	// Rule 7: Style - tiny change
-	if ins+del < 5 && ins+del > 0 {
-		add("style: format code", "tiny change")
-	}
-
-	// Parse diff for dynamic suggestions
-	addedLines, removedLines := parseDiffLines(diff)
-
-	// Rule 8: Function detection
-	if funcName := findAddedFunction(addedLines); funcName!= "" {
-		scope := getScope(files[0])
-		add(fmt.Sprintf("feat%s: add %s", scope, funcName), "new function")
-	}
-
-	// Rule 9: Fix pattern
-	if isFix(addedLines, removedLines) {
-		scope := getScope(files[0])
-		add(fmt.Sprintf("fix%s: resolve issue", scope), "bug fix pattern")
-	}
-
-	// Rule 10: Debug code
-	if hasDebugCode(addedLines) {
-		add("chore: add debug logs", "debug code")
-	}
-	if hasRemovedDebug(removedLines) {
-		add("chore: remove debug logs", "cleanup")
-	}
-
-	// Rule 11: Import change
-	if hasImportChange(addedLines, removedLines) {
-		add("refactor: update imports", "import change")
-	}
-
-	// Rule 12: Folder based
-	if folderType := getFolderType(files[0]); folderType!= "" {
-		name := cleanName(files[0])
-		add(fmt.Sprintf("%s: update %s", folderType, name), "folder based")
-	}
-
-	// FORCE 3 SUGGESTIONS
+	// FORCE 3 SUGGESTIONS with detailed bodies
 	baseName := cleanName(files[0])
 	scope := getScope(files[0])
-	changeDesc := analyzeChanges(addedLines, removedLines)
+	ins, del := parseStat(stat)
+
+	genericBody1 := fmt.Sprintf("- Modified %s\n- Updated %d files\n- %d insertions(+), %d deletions(-)",
+		baseName, len(files), ins, del)
+	genericBody2 := fmt.Sprintf("- Improve %s implementation\n- Update related logic", baseName)
+	genericBody3 := "- Apply code changes\n- Update functionality"
 
 	fallbacks := []Suggestion{
-		{fmt.Sprintf("chore%s: update %s", scope, baseName), "fallback"},
-		{fmt.Sprintf("refactor%s: %s", scope, changeDesc), "generic"},
-		{fmt.Sprintf("feat%s: enhance functionality", scope), "generic"},
-		{fmt.Sprintf("chore: apply code changes"), "generic"},
+		{fmt.Sprintf("chore%s: update %s", scope, baseName), genericBody1, "fallback"},
+		{fmt.Sprintf("refactor%s: improve %s", scope, baseName), genericBody2, "generic"},
+		{fmt.Sprintf("feat%s: enhance functionality", scope), genericBody3, "generic"},
 	}
 
 	for _, g := range fallbacks {
 		if len(suggestions) >= 3 {
 			break
 		}
-		add(g.Msg, g.Rule)
+		add(g.Subject, g.Body, g.Rule)
 	}
 
 	// Print suggestions
 	fmt.Println()
 	green.Println("Select a commit message:")
 	for i, s := range suggestions {
-		fmt.Printf("%d. %s\n", i+1, s.Msg)
+		fmt.Printf("%d. %s\n", i+1, s.Subject)
+		if s.Body!= "" {
+			for _, line := range strings.Split(s.Body, "\n") {
+				hiBlack.Printf(" %s\n", line)
+			}
+		}
 		hiBlack.Printf(" %s\n", s.Rule)
+		fmt.Println()
 	}
 	hiBlack.Println("q. quit")
 
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("\nChoice [1-3/q]: ")
+	fmt.Print("Choice [1-3/q]: ")
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 
@@ -189,7 +184,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	msg := suggestions[num-1].Msg
+	selected := suggestions[num-1]
+	msg := selected.Subject
+	if selected.Body!= "" {
+		msg = selected.Subject + "\n\n" + selected.Body
+	}
+
 	cmd := exec.Command("git", "commit", "-m", msg)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -197,7 +197,18 @@ func main() {
 		red.Printf("Commit failed: %v\n", err)
 		os.Exit(1)
 	}
-	green.Printf("Committed: %s\n", msg)
+	green.Printf("Committed: %s\n", selected.Subject)
+}
+
+// --- STRUCTS & HELPERS ---
+
+type ChangeAnalysis struct {
+	NewFunctions []string
+	IsFix bool
+	FixDetails []string
+	IsRefactor bool
+	ImportChanges bool
+	ImportDetails []string
 }
 
 func runGit(args...string) (string, error) {
@@ -222,89 +233,113 @@ func cleanName(file string) string {
 	return strings.ToLower(name)
 }
 
+func getNewFiles(status string) []string {
+	var files []string
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, "A\t") {
+			files = append(files, strings.TrimPrefix(line, "A\t"))
+		}
+	}
+	return files
+}
+
+func getDeletedFiles(status string) []string {
+	var files []string
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, "D\t") {
+			files = append(files, strings.TrimPrefix(line, "D\t"))
+		}
+	}
+	return files
+}
+
 func parseDiffLines(diff string) ([]string, []string) {
 	var added, removed []string
 	for _, line := range strings.Split(diff, "\n") {
 		if strings.HasPrefix(line, "+") &&!strings.HasPrefix(line, "+++") {
-			added = append(added, strings.TrimPrefix(line, "+"))
+			added = append(added, strings.TrimSpace(strings.TrimPrefix(line, "+")))
 		}
 		if strings.HasPrefix(line, "-") &&!strings.HasPrefix(line, "---") {
-			removed = append(removed, strings.TrimPrefix(line, "-"))
+			removed = append(removed, strings.TrimSpace(strings.TrimPrefix(line, "-")))
 		}
 	}
 	return added, removed
 }
 
-func findAddedFunction(addedLines []string) string {
-	re := regexp.MustCompile(`(?i)func\s+(\w+)|function\s+(\w+)|const\s+(\w+)\s*=|def\s+(\w+)`)
-	for _, line := range addedLines {
+func analyzeChangesDetailed(added, removed []string, files []string) ChangeAnalysis {
+	analysis := ChangeAnalysis{}
+	
+	// Find new functions
+	re := regexp.MustCompile(`(?i)^func\s+(\w+)|^function\s+(\w+)|^const\s+(\w+)\s*=.*=>|^def\s+(\w+)`)
+	for _, line := range added {
 		if m := re.FindStringSubmatch(line); len(m) > 1 {
 			for i := 1; i < len(m); i++ {
 				if m[i]!= "" {
-					return strings.ToLower(m[i])
+					analysis.NewFunctions = append(analysis.NewFunctions, strings.ToLower(m[i]))
 				}
 			}
 		}
 	}
-	return ""
-}
 
-func isFix(added, removed []string) bool {
-	fixKeywords := []string{"fix", "bug", "error", "issue", "null", "undefined", "nil", "panic", "exception"}
+	// Check for fixes
+	fixKeywords := []string{"fix", "bug", "error", "null", "undefined", "panic", "exception", "issue"}
 	for _, line := range append(added, removed...) {
 		l := strings.ToLower(line)
 		for _, kw := range fixKeywords {
-			if strings.Contains(l, kw) {
-				return true
+			if strings.Contains(l, kw) && len(line) < 100 {
+				analysis.IsFix = true
+				analysis.FixDetails = append(analysis.FixDetails, strings.TrimSpace(line))
+				break
 			}
 		}
 	}
-	return false
-}
 
-func hasDebugCode(added []string) bool {
-	for _, line := range added {
-		l := strings.ToLower(strings.TrimSpace(line))
-		if strings.HasPrefix(l, "console.log") || strings.HasPrefix(l, "print(") ||
-		   strings.HasPrefix(l, "fmt.print") || strings.HasPrefix(l, "debugger") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasRemovedDebug(removed []string) bool {
-	for _, line := range removed {
-		l := strings.ToLower(strings.TrimSpace(line))
-		if strings.HasPrefix(l, "console.log") || strings.HasPrefix(l, "print(") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasImportChange(added, removed []string) bool {
+	// Check imports
 	for _, line := range append(added, removed...) {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "import ") || strings.HasPrefix(l, "require(") ||
 		   strings.HasPrefix(l, "from ") || strings.HasPrefix(l, "use ") {
-			return true
+			analysis.ImportChanges = true
+			analysis.ImportDetails = append(analysis.ImportDetails, l)
 		}
 	}
-	return false
+
+	// Refactor detection
+	if len(removed) > len(added)*2 && len(removed) > 3 {
+		analysis.IsRefactor = true
+	}
+
+	return analysis
 }
 
-func analyzeChanges(added, removed []string) string {
-	if len(added) > len(removed)*2 {
-		return "add new code"
+func buildBodyFromFiles(prefix string, files []string) string {
+	if len(files) == 0 {
+		return ""
 	}
-	if len(removed) > len(added)*2 {
-		return "remove code"
+	lines := []string{prefix}
+	for i, f := range files {
+		if i >= 5 {
+			lines = append(lines, fmt.Sprintf("-... and %d more", len(files)-5))
+			break
+		}
+		lines = append(lines, "- "+filepath.Base(f))
 	}
-	if len(added) > 0 && len(removed) > 0 {
-		return "modify implementation"
+	return strings.Join(lines, "\n")
+}
+
+func buildBodyFromItems(prefix string, items []string) string {
+	if len(items) == 0 {
+		return ""
 	}
-	return "update code"
+	lines := []string{prefix}
+	seen := make(map[string]bool)
+	for _, item := range items {
+		if!seen[item] && len(lines) < 6 {
+			lines = append(lines, "- "+item)
+			seen[item] = true
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func onlyMatch(files []string, patterns []string) bool {
@@ -351,32 +386,4 @@ func parseStat(stat string) (int, int) {
 		del, _ = strconv.Atoi(m[1])
 	}
 	return ins, del
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-func getFolderType(file string) string {
-	f := strings.ToLower(file)
-	if strings.Contains(f, "api/") || strings.Contains(f, "routes/") ||
-	   strings.Contains(f, "controller") || strings.Contains(f, "handler") {
-		return "feat"
-	}
-	if strings.Contains(f, "util") || strings.Contains(f, "helper") ||
-	   strings.Contains(f, "lib/") || strings.Contains(f, "pkg/") {
-		return "refactor"
-	}
-	if strings.Contains(f, "test") || strings.Contains(f, "spec") {
-		return "test"
-	}
-	if strings.Contains(f, "config") || strings.Contains(f, "env") {
-		return "chore"
-	}
-	return ""
 }
