@@ -3,357 +3,243 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/fatih/color"
 )
-//test commit is corking commit bro or not
+
+type Suggestion struct {
+	Msg string
+	Rule string
+}
+
 func main() {
-	// Check if git is available
-	if _, err := exec.LookPath("git"); err != nil {
-		log.Fatal("git not found in PATH")
+	green := color.New(color.FgGreen)
+	yellow := color.New(color.FgYellow)
+	red := color.New(color.FgRed)
+	cyan := color.New(color.FgCyan)
+	hiBlack := color.New(color.FgHiBlack)
+
+	// Check git
+	if _, err := exec.LookPath("git"); err!= nil {
+		red.Println("❌ Git not found in PATH. Install from https://git-scm.com")
+		os.Exit(1)
 	}
 
-	// Run git diff --staged --name-only
-	cmd := exec.Command("git", "diff", "--staged", "--name-only")
-	output, err := cmd.Output()
-	if err != nil {
-		log.Fatal("error running git diff --name-only: ", err)
-	}
-
-	filesStr := strings.TrimSpace(string(output))
+	// Check staged files
+	nameOnly, _ := runGit("diff", "--staged", "--name-only")
+	filesStr := strings.TrimSpace(nameOnly)
 	if filesStr == "" {
-		log.Fatal("no staged files to commit")
+		yellow.Println("⚠️ No staged files found. Run 'git add' first.")
+		os.Exit(1)
 	}
 	files := strings.Split(filesStr, "\n")
 
-	// Run git diff --staged
-	cmd = exec.Command("git", "diff", "--staged")
-	diffOutput, err := cmd.Output()
-	if err != nil {
-		log.Fatal("error running git diff: ", err)
-	}
-	diff := string(diffOutput)
+	// Get diff, stat, status
+	diff, _ := runGit("diff", "--staged")
+	stat, _ := runGit("diff", "--staged", "--shortstat")
+	status, _ := runGit("diff", "--staged", "--name-status")
 
-	// Check if this is the first commit
-	cmd = exec.Command("git", "log", "--oneline", "-1")
-	_, err = cmd.Output()
-	isFirstCommit := err != nil
+	cyan.Println("🤖 Analyzing changes...")
 
-	var lastCommitType string
-	if !isFirstCommit {
-		// Get last commit message to infer type
-		cmd = exec.Command("git", "log", "--oneline", "-1")
-		lastOutput, _ := cmd.Output()
-		lastMsg := strings.TrimSpace(string(lastOutput))
-		if strings.Contains(lastMsg, ": ") {
-			lastCommitType = strings.Split(lastMsg, ": ")[0]
+	suggestions := []Suggestion{}
+	seen := make(map[string]bool)
+
+	add := func(msg, rule string) {
+		if!seen[msg] && len(suggestions) < 3 {
+			suggestions = append(suggestions, Suggestion{msg, rule})
+			seen[msg] = true
 		}
 	}
 
-	// Determine commit type based on rules
-	commitType := determineCommitType(files, diff, isFirstCommit)
-
-	// Generate 3 unique suggestions
-	suggestions := generateSuggestions(commitType, files, diff, lastCommitType)
-
-	// Print colored suggestions
-	cyan := color.New(color.FgCyan)
-	for i, sug := range suggestions {
-		cyan.Printf("%d. %s\n", i+1, sug)
+	// Rule 1: Version bump
+	for _, f := range files {
+		if strings.HasSuffix(f, "package.json") {
+			re := regexp.MustCompile(`\+\s*"version":\s*"(.*)"`)
+			if m := re.FindStringSubmatch(diff); len(m) > 1 {
+				add(fmt.Sprintf("chore: bump version to %s", m[1]), "version bump")
+			}
+		if strings.HasSuffix(f, "Cargo.toml") {
+			re := regexp.MustCompile(`\+\s*version\s*=\s*"(.*)"`)
+			if m := re.FindStringSubmatch(diff); len(m) > 1 {
+				add(fmt.Sprintf("chore: bump version to %s", m[1]), "version bump")
+			}
+		}
 	}
 
-	// Read user input
+	// Rule 2: New file
+	if strings.Contains(status, "A\t") {
+		for _, line := range strings.Split(status, "\n") {
+			if strings.HasPrefix(line, "A\t") {
+				f := strings.TrimPrefix(line, "A\t")
+				scope := getScope(f)
+				name := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+				add(fmt.Sprintf("feat%s: add %s", scope, name), "new file")
+				break
+			}
+		}
+	}
+
+	// Rule 3: Delete file
+	if strings.Contains(status, "D\t") {
+		for _, line := range strings.Split(status, "\n") {
+			if strings.HasPrefix(line, "D\t") {
+				f := strings.TrimPrefix(line, "D\t")
+				name := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+				add(fmt.Sprintf("refactor: remove %s", name), "delete file")
+				break
+			}
+		}
+	}
+
+	// Rule 4: Only test files
+	if onlyMatch(files, []string{".test.", "_test.", ".spec."}) {
+		add("test: update tests", "only test files")
+	}
+
+	// Rule 5: Only docs
+	if onlyExt(files, ".md", ".txt", ".rst") {
+		add("docs: update documentation", "only docs")
+	}
+
+	// Rule 6: Refactor by stats
+	ins, del := parseStat(stat)
+	if del > ins*2 && del > 0 {
+		add("refactor: simplify code", "deletions >> insertions")
+	}
+
+	// Rule 7: Style - tiny change
+	if ins+del < 5 && ins+del > 0 {
+		add("style: format code", "tiny change")
+	}
+
+	// Rule 8/9: package.json deps
+	if contains(files, "package.json") {
+		if strings.Contains(diff, `+ "`) &&!strings.Contains(diff, `- "`) {
+			add("feat: add dependency", "package.json add")
+		}
+		if strings.Contains(diff, `- "`) &&!strings.Contains(diff, `+ "`) {
+			add("chore: remove dependency", "package.json remove")
+		}
+	}
+
+	// Rule 10:.env.example
+	if contains(files, ".env.example") {
+		add("chore: update env", ".env change")
+	}
+
+	// Rule 11: Folder based
+	if folderType := getFolderType(files); folderType!= "" {
+		name := strings.TrimSuffix(filepath.Base(files[0]), filepath.Ext(files[0]))
+		add(fmt.Sprintf("%s: update %s", folderType, name), "folder based")
+	}
+
+	// Rule 12: Fallback
+	if len(suggestions) == 0 {
+		name := strings.TrimSuffix(filepath.Base(files[0]), filepath.Ext(files[0]))
+		add(fmt.Sprintf("chore: update %s", name), "fallback")
+	}
+
+	// Print suggestions
+	fmt.Println()
+	green.Println("Select a commit message:")
+	for i, s := range suggestions {
+		fmt.Printf("%d. %s\n", i+1, s.Msg)
+		hiBlack.Printf(" └─ %s\n", s.Rule)
+	}
+	hiBlack.Println("q. quit")
+
+	// Input
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Choose 1-3 or 'q' to quit: ")
+	fmt.Print("\nChoice [1-3/q]: ")
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 
 	if input == "q" {
-		fmt.Println("Exiting without committing.")
+		yellow.Println("Cancelled.")
 		return
 	}
 
 	num, err := strconv.Atoi(input)
-	if err != nil || num < 1 || num > 3 {
-		log.Fatal("invalid input: choose 1, 2, 3, or q")
+	if err!= nil || num < 1 || num > len(suggestions) {
+		red.Println("❌ Invalid input.")
+		os.Exit(1)
 	}
 
-	msg := suggestions[num-1]
-
-	// Execute git commit
-	cmd = exec.Command("git", "commit", "-m", msg)
-	err = cmd.Run()
-	if err != nil {
-		log.Fatal("commit failed: ", err)
+	msg := suggestions[num-1].Msg
+	cmd := exec.Command("git", "commit", "-m", msg)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err!= nil {
+		red.Printf("❌ Commit failed: %v\n", err)
+		os.Exit(1)
 	}
-
-	fmt.Println("Committed successfully with message:", msg)
+	green.Printf("✅ Committed: %s\n", msg)
 }
 
-func determineCommitType(files []string, diff string, isFirstCommit bool) string {
-	if isFirstCommit {
-		return "initial"
-	}
-
-	hasNew := false
-	hasDelete := false
-	hasTest := false
-	hasDocs := false
-	hasDepAdd := false
-	hasDepRemove := false
-	hasEnv := false
-	hasVersion := false
-	hasStyle := false
-	hasRefactor := false
-
-	// Analyze files
-	for _, file := range files {
-		lowerFile := strings.ToLower(file)
-		if strings.Contains(lowerFile, "test") || strings.HasSuffix(lowerFile, "_test.go") || strings.HasSuffix(lowerFile, ".spec.js") {
-			hasTest = true
-		}
-		if strings.Contains(lowerFile, "readme") || strings.HasSuffix(lowerFile, ".md") || strings.HasSuffix(lowerFile, ".txt") {
-			hasDocs = true
-		}
-		if strings.Contains(lowerFile, "package.json") || strings.Contains(lowerFile, "version") || strings.Contains(lowerFile, "cargo.toml") {
-			hasVersion = true
-		}
-		if strings.Contains(lowerFile, ".env") || strings.Contains(lowerFile, "config") || strings.Contains(lowerFile, "settings") {
-			hasEnv = true
-		}
-		if strings.Contains(lowerFile, "go.mod") || strings.Contains(lowerFile, "requirements.txt") || strings.Contains(lowerFile, "package-lock.json") {
-			// Check for additions/removals in diff
-			if strings.Contains(diff, "+") && strings.Contains(diff, "-") {
-				hasRefactor = true
-			} else if strings.Count(diff, "+") > strings.Count(diff, "-") {
-				hasDepAdd = true
-			} else if strings.Count(diff, "-") > strings.Count(diff, "+") {
-				hasDepRemove = true
-			}
-		}
-	}
-
-	// Analyze diff for new/delete files
-	lines := strings.Split(diff, "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "+++ ") && strings.Contains(line, "/dev/null") {
-			hasDelete = true
-		} else if strings.HasPrefix(line, "+++ ") {
-			hasNew = true
-		}
-	}
-
-	// Check for style changes (only whitespace)
-	addLines := 0
-	delLines := 0
-	for _, line := range lines {
-		if strings.HasPrefix(line, "+") && strings.TrimSpace(line[1:]) == "" {
-			addLines++
-		}
-		if strings.HasPrefix(line, "-") && strings.TrimSpace(line[1:]) == "" {
-			delLines++
-		}
-	}
-	if addLines > 0 && delLines > 0 && addLines == delLines {
-		hasStyle = true
-	}
-
-	// Folder based type
-	folderBased := true
-	for _, file := range files {
-		if !strings.HasPrefix(file, "src/") && !strings.HasPrefix(file, "lib/") && !strings.HasPrefix(file, "app/") {
-			folderBased = false
-			break
-		}
-	}
-
-	// Apply rules in order
-	if hasVersion {
-		return "version"
-	}
-	if hasNew && !hasDelete {
-		return "feat"
-	}
-	if hasDelete && !hasNew {
-		return "feat"
-	}
-	if hasTest && len(files) == 1 {
-		return "test"
-	}
-	if hasDocs && len(files) == 1 {
-		return "docs"
-	}
-	if hasRefactor {
-		return "refactor"
-	}
-	if hasStyle {
-		return "style"
-	}
-	if hasDepAdd {
-		return "deps"
-	}
-	if hasDepRemove {
-		return "deps"
-	}
-	if hasEnv {
-		return "env"
-	}
-	if folderBased {
-		return "feat"
-	}
-	return "feat" // fallback
+func runGit(args...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	out, err := cmd.Output()
+	return string(out), err
 }
 
-func generateSuggestions(commitType string, files []string, diff string, lastCommitType string) []string {
-	// If last commit type is known, prefer similar or varied
-	preferred := []string{"feat", "fix", "refactor", "docs", "style", "test", "chore"}
-	if lastCommitType != "" && contains(preferred, lastCommitType) {
-		// Rotate to start with last type
-		idx := indexOf(preferred, lastCommitType)
-		preferred = append(preferred[idx:], preferred[:idx]...)
+func getScope(file string) string {
+	parts := strings.Split(filepath.ToSlash(file), "/")
+	if len(parts) > 1 && parts[0]!= "." {
+		return fmt.Sprintf("(%s)", parts[0])
 	}
+	return ""
+}
 
-	switch commitType {
-	case "initial":
-		return []string{
-			"chore: initial commit",
-			"feat: initial implementation",
-			"docs: project setup",
-		}
-	case "version":
-		return []string{
-			"bump: version to latest",
-			"release: bump version number",
-			"chore: update version",
-		}
-	case "test":
-		return []string{
-			"test: add unit tests",
-			"test: update test cases",
-			"test: fix failing tests",
-		}
-	case "docs":
-		return []string{
-			"docs: update documentation",
-			"docs: add README section",
-			"docs: fix documentation errors",
-		}
-	case "refactor":
-		return []string{
-			"refactor: restructure code",
-			"refactor: rename variables",
-			"refactor: optimize performance",
-		}
-	case "style":
-		return []string{
-			"style: format code",
-			"style: fix indentation",
-			"style: update code style",
-		}
-	case "deps":
-		return []string{
-			"deps: add new dependency",
-			"deps: update dependencies",
-			"deps: remove unused dependency",
-		}
-	case "env":
-		return []string{
-			"env: update environment variables",
-			"env: add config settings",
-			"env: fix environment setup",
-		}
-	default: // feat or fallback
-		// Analyze diff for additions and deletions
-		addCount := strings.Count(diff, "\n+")
-		delCount := strings.Count(diff, "\n-")
-
-		// Check for specific keywords in diff to make smarter suggestions
-		hasFirstCommit := strings.Contains(diff, "isFirstCommit") || strings.Contains(diff, "initial")
-		hasHistory := strings.Contains(diff, "lastCommitType") || strings.Contains(diff, "history")
-		hasSuggestions := strings.Contains(diff, "generateSuggestions") || strings.Contains(diff, "suggestion")
-
-		if hasFirstCommit && hasHistory && hasSuggestions {
-			return []string{
-				"feat: enhance commit message generation with first commit detection and history-aware suggestions",
-				"feat: implement intelligent commit type analysis based on git history",
-				"feat: add context-aware suggestion system with initial commit handling",
+func onlyMatch(files []string, patterns []string) bool {
+	for _, f := range files {
+		ok := false
+		lf := strings.ToLower(f)
+		for _, p := range patterns {
+			if strings.Contains(lf, p) {
+				ok = true
+				break
 			}
 		}
-		if hasFirstCommit {
-			return []string{
-				"feat: add first commit detection logic",
-				"feat: implement initial commit message suggestions",
-				"feat: enhance tool with repository initialization checks",
-			}
-		}
-		if hasHistory {
-			return []string{
-				"feat: integrate git history analysis for consistent commit types",
-				"feat: add last commit type detection",
-				"feat: improve suggestions based on previous commits",
-			}
-		}
-		if hasSuggestions {
-			return []string{
-				"feat: enhance suggestion generation logic",
-				"feat: implement smarter commit message proposals",
-				"feat: add dynamic suggestion system",
-			}
-		}
-
-		// Based on diff size
-		totalChanges := addCount + delCount
-		if totalChanges < 5 {
-			return []string{
-				"feat: add minor improvements",
-				"fix: resolve small issues",
-				"docs: update comments or documentation",
-			}
-		}
-		if addCount > delCount * 2 {
-			return []string{
-				"feat: add significant new functionality",
-				"feat: implement major feature enhancements",
-				"feat: expand application capabilities",
-			}
-		} else if delCount > addCount * 2 {
-			return []string{
-				"feat: remove obsolete code and simplify logic",
-				"refactor: clean up and optimize code",
-				"feat: streamline application structure",
-			}
-		} else if addCount > 0 && delCount > 0 {
-			return []string{
-				"refactor: modify and improve existing code",
-				"feat: update functionality with changes",
-				"feat: enhance features through code modifications",
-			}
-		}
-
-		// Make more descriptive based on files
-		desc := "new functionality"
-		if len(files) == 1 {
-			if strings.Contains(files[0], "main") {
-				desc = "main application logic"
-			} else if strings.Contains(files[0], "test") {
-				desc = "test coverage"
-			} else if strings.Contains(files[0], "readme") {
-				desc = "documentation"
-			}
-		} else if len(files) > 1 {
-			desc = "multiple files"
-		}
-		return []string{
-			fmt.Sprintf("%s: implement %s", preferred[0], desc),
-			fmt.Sprintf("%s: resolve issue", preferred[1]),
-			fmt.Sprintf("%s: add %s", preferred[0], desc),
+		if!ok {
+			return false
 		}
 	}
+	return len(files) > 0
+}
+
+func onlyExt(files []string, exts...string) bool {
+	for _, f := range files {
+		ok := false
+		for _, ext := range exts {
+			if strings.HasSuffix(f, ext) {
+				ok = true
+				break
+			}
+		}
+		if!ok {
+			return false
+		}
+	}
+	return len(files) > 0
+}
+
+func parseStat(stat string) (int, int) {
+	reIns := regexp.MustCompile(`(\d+) insertion`)
+	reDel := regexp.MustCompile(`(\d+) deletion`)
+	ins, del := 0, 0
+	if m := reIns.FindStringSubmatch(stat); len(m) > 1 {
+		ins, _ = strconv.Atoi(m[1])
+	}
+	if m := reDel.FindStringSubmatch(stat); len(m) > 1 {
+		del, _ = strconv.Atoi(m[1])
+	}
+	return ins, del
 }
 
 func contains(slice []string, item string) bool {
@@ -365,11 +251,16 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-func indexOf(slice []string, item string) int {
-	for i, s := range slice {
-		if s == item {
-			return i
-		}
+func getFolderType(files []string) string {
+	if len(files) == 0 {
+		return ""
 	}
-	return -1
+	f := strings.ToLower(files[0])
+	if strings.Contains(f, "api/") || strings.Contains(f, "routes/") || strings.Contains(f, "controller") {
+		return "feat"
+	}
+	if strings.Contains(f, "util") || strings.Contains(f, "helper") || strings.Contains(f, "lib/") {
+		return "refactor"
+	}
+	return ""
 }
