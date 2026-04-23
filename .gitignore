@@ -32,10 +32,17 @@ Thumbs.db
 
 # Temporary files
 *.tmp
+.gocache/
+builds/
 
 # Build artifacts
 gitbro.exe
 gitbro-setup.exe
+gitbro-linux
+gitbro-macos-*
+linux/gitbro-linux
+macos/gitbro-macos-*
+windows/gitbro.exe
 
 # Installer output
 Output/
