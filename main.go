@@ -46,6 +46,14 @@ type GeminiResponse struct {
 	} `json:"candidates"`
 }
 
+type GeminiError struct {
+	Error struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Status  string `json:"status"`
+	} `json:"error"`
+}
+
 func main() {
 	green := color.New(color.FgGreen)
 	yellow := color.New(color.FgYellow)
@@ -190,6 +198,10 @@ Format: [{"subject":"feat(auth): add login","body":"- Add handleLogin function\n
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
+		var geminiErr GeminiError
+		if err := json.Unmarshal(body, &geminiErr); err == nil {
+			return nil, fmt.Errorf("gemini API error %d: %s", resp.StatusCode, geminiErr.Error.Message)
+		}
 		return nil, fmt.Errorf("gemini API error %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -379,5 +391,3 @@ func parseStat(stat string) (int, int) {
 	}
 	return ins, del
 }
-
-// hello
